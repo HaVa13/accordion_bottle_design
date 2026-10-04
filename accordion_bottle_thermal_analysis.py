@@ -1,105 +1,136 @@
 # accordion_bottle_thermal_analysis.py
-# Parametric design and thermal evaluation for a collapsible beverage bottle
-# Updated material: PP COPO / Moplen EP310D HP (ALBIS)
-# Source: http://hongrunplastics.com/public/uploads/images/20250809/ALBIS%20PP%20COPO%20Moplen%20EP310D%20HP.pdf
-# Values used are screening-level engineering estimates based on manufacturer data and PE/PP polymer trends.
-# Goal: optimize 300 mL accordion bottle with hot liquid use.
+# Final parametric design + optimization + 3D mesh generation
+# Target: accordion beverage pack for 300 mL, max diameter 70 mm,
+# compressed height <25 mm, hot water use, PP COPO / Moplen EP310D HP
+# File output: final_accordion_bottle.obj and final_design_summary.json
 
 import json
 import math
+from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Tuple
 
 import numpy as np
 
 
-# ----------------------------
-# 1) Material properties: PP COPO / Moplen EP310D HP
-# ----------------------------
-class PPMaterialProperties:
-    def __init__(self):
-        self.name = "PP COPO / Moplen EP310D HP"
-        self.density_g_cm3 = 0.90
-        self.tensile_strength_mpa_rt = 25.0  # nominal yield, ~22-27 MPa
-        self.elastic_modulus_mpa = 1100.0
-        self.glass_transition_temp_c = -10.0
-        self.heat_deflection_temp_045mpa_c = 65.0
-        self.heat_deflection_temp_18mpa_c = 50.0
-        self.max_service_temp_c = 60.0
-        self.melting_temp_c = 160.0
-        self.thermal_expansion_coeff_1_per_k = 11e-5  # 110 ppm/K
-        self.wall_thickness_mm = 2.2
+# ============================================================
+# 1) Material data for PP COPO / Moplen EP310D HP
+# ============================================================
+@dataclass
+class MaterialPP:
+    name: str = "PP COPO / Moplen EP310D HP"
+    density_g_cm3: float = 0.90
+    tensile_strength_mpa_rt: float = 25.0
+    elastic_modulus_mpa: float = 1100.0
+    glass_transition_temp_c: float = -10.0
+    heat_deflection_temp_045mpa_c: float = 65.0
+    heat_deflection_temp_18mpa_c: float = 50.0
+    max_service_temp_c: float = 60.0
+    melting_temp_c: float = 160.0
+    thermal_expansion_coeff_1_per_k: float = 11e-5
+    wall_thickness_mm: float = 2.2
 
 
-# ----------------------------
-# 2) Temperature-dependent tensile strength model for PP
-# ----------------------------
-def tensile_strength_vs_temperature(temperature_c: float, material: PPMaterialProperties) -> float:
-    """
-    Conservative approximation for PP copolymer.
-    Strength decreases with temperature, especially beyond ~60°C.
-    """
+MATERIAL = MaterialPP()
+
+
+# ============================================================
+# 2) Design constraints
+# ============================================================
+TARGET_VOLUME_ML = 300.0
+MIN_WATER_CAPACITY_ML = 250.0
+MAX_DIAMETER_MM = 70.0
+MAX_COMPRESSED_HEIGHT_MM = 25.0
+TARGET_OPERATING_TEMP_C = 80.0
+SAFETY_TARGET = 2.0
+
+
+# ============================================================
+# 3) Material strength vs temperature
+# ============================================================
+def tensile_strength_vs_temperature(temperature_c: float, material: MaterialPP = MATERIAL) -> float:
     sigma_ref = material.tensile_strength_mpa_rt
     T_ref = 23.0
 
     if temperature_c <= material.glass_transition_temp_c:
-        sigma = sigma_ref * 1.05
-    elif material.glass_transition_temp_c < temperature_c <= material.max_service_temp_c:
+        return max(0.05, sigma_ref * 1.05)
+
+    if material.glass_transition_temp_c < temperature_c <= material.max_service_temp_c:
         delta_t = temperature_c - T_ref
         reduction = 1.0 - 0.012 * abs(delta_t)
         sigma = sigma_ref * max(0.35, reduction)
-    elif material.max_service_temp_c < temperature_c < material.melting_temp_c:
+        return max(0.05, sigma)
+
+    if material.max_service_temp_c < temperature_c < material.melting_temp_c:
         delta_t = temperature_c - material.max_service_temp_c
         softening_span = material.melting_temp_c - material.max_service_temp_c
         sigma_at_limit = sigma_ref * 0.35
         reduction = math.exp(-0.20 * (delta_t / softening_span))
         sigma = sigma_at_limit * reduction
-    else:
-        sigma = 0.05
+        return max(0.05, sigma)
 
-    return max(0.05, sigma)
-
-
-def safety_factor_vs_temperature(temperature_c: float, material: PPMaterialProperties, design_stress_mpa: float) -> float:
-    sigma = tensile_strength_vs_temperature(temperature_c, material)
-    if design_stress_mpa <= 0:
-        return float("inf")
-    return sigma / design_stress_mpa
+    return 0.05
 
 
-# ----------------------------
-# 3) Stress models
-# ----------------------------
-def hoop_stress_mpa(internal_pressure_mpa: float, outer_diameter_mm: float, wall_thickness_mm: float) -> float:
-    if wall_thickness_mm <= 0:
-        return float("inf")
-    return (internal_pressure_mpa * outer_diameter_mm) / (2.0 * wall_thickness_mm)
-
-
-def hydrostatic_pressure_mpa(liquid_height_mm: float, liquid_density_g_cm3: float = 1.0, gravity_m_s2: float = 9.81) -> float:
+# ============================================================
+# 4) Stress and structural checks
+# ============================================================
+def hydrostatic_pressure_mpa(liquid_height_mm: float, density_g_cm3: float = 1.0, g: float = 9.81) -> float:
     height_m = liquid_height_mm / 1000.0
-    density_kg_m3 = liquid_density_g_cm3 * 1000.0
-    pressure_pa = density_kg_m3 * gravity_m_s2 * height_m
+    density_kg_m3 = density_g_cm3 * 1000.0
+    pressure_pa = density_kg_m3 * g * height_m
     return pressure_pa / 1e6
 
 
+def hoop_stress_mpa(internal_pressure_mpa: float, diameter_mm: float, wall_thickness_mm: float) -> float:
+    if wall_thickness_mm <= 0:
+        return float("inf")
+    return (internal_pressure_mpa * diameter_mm) / (2.0 * wall_thickness_mm)
+
+
 def thermal_expansion_stress_mpa(delta_temp_c: float, elastic_modulus_mpa: float,
-                                 thermal_expansion_coeff_1_per_k: float = 11e-5) -> float:
+                                 thermal_expansion_coeff_1_per_k: float) -> float:
     return elastic_modulus_mpa * thermal_expansion_coeff_1_per_k * delta_temp_c
 
 
-# ----------------------------
-# 4) Bellows geometry model
-# ----------------------------
+def evaluate_thermal_safety(candidate: Dict[str, Any], temperature_c: float = TARGET_OPERATING_TEMP_C,
+                            material: MaterialPP = MATERIAL) -> Dict[str, Any]:
+    D = candidate["diameter_mm"]
+    H = candidate["height_mm"]
+    wall = material.wall_thickness_mm
+
+    delta_t = temperature_c - 23.0
+    sigma_thermal = thermal_expansion_stress_mpa(delta_t, material.elastic_modulus_mpa,
+                                                material.thermal_expansion_coeff_1_per_k)
+    p_hydro = hydrostatic_pressure_mpa(H, 1.0)
+    sigma_hydro = hoop_stress_mpa(p_hydro, D, wall)
+    sigma_total = sigma_thermal + sigma_hydro
+    sigma_material = tensile_strength_vs_temperature(temperature_c, material)
+    safety_factor = sigma_material / sigma_total if sigma_total > 0 else float("inf")
+
+    return {
+        "temperature_c": temperature_c,
+        "thermal_stress_mpa": sigma_thermal,
+        "hydrostatic_stress_mpa": sigma_hydro,
+        "combined_stress_mpa": sigma_total,
+        "material_strength_mpa": sigma_material,
+        "safety_factor": safety_factor,
+        "is_safe": safety_factor >= SAFETY_TARGET,
+        "margin_pct": ((sigma_material - sigma_total) / sigma_material * 100.0) if sigma_material > 0 else 0.0,
+    }
+
+
+# ============================================================
+# 5) Accordion geometry
+# ============================================================
 def bellows_radius_profile(z_mm: np.ndarray, height_mm: float, diameter_mm: float,
                            folds: int, amplitude_mm: float) -> np.ndarray:
-    radius_base_mm = diameter_mm / 2.0
+    radius_base = diameter_mm / 2.0
     wave = np.sin(2.0 * np.pi * folds * z_mm / max(height_mm, 1e-6))
-    r = radius_base_mm + amplitude_mm * wave
-    return np.maximum(r, 2.0)
+    return np.maximum(radius_base + amplitude_mm * wave, 2.0)
 
 
-def bellows_volume_mm3(height_mm: float, diameter_mm: float,
-                      folds: int, amplitude_mm: float, samples: int = 4000) -> float:
+def bellows_volume_mm3(height_mm: float, diameter_mm: float, folds: int, amplitude_mm: float,
+                      samples: int = 4000) -> float:
     z = np.linspace(0.0, height_mm, samples)
     r = bellows_radius_profile(z, height_mm, diameter_mm, folds, amplitude_mm)
     area = np.pi * r**2
@@ -111,133 +142,213 @@ def compressed_height_estimate(height_mm: float, folds: int, amplitude_mm: float
     return max(0.0, height_mm - 0.9 * folds * amplitude_mm)
 
 
-# ----------------------------
-# 5) Feasible design search
-# ----------------------------
-def generate_feasible_candidates() -> List[Dict[str, Any]]:
-    candidates: List[Dict[str, Any]] = []
-    for diameter in np.arange(35.0, 71.0, 1.0):
-        for height in np.arange(60.0, 180.0, 1.0):
-            for folds in range(4, 28):
-                for amplitude in np.arange(1.0, 18.0, 0.5):
-                    volume = bellows_volume_mm3(height, diameter, folds, amplitude)
-                    volume_ml = volume / 1000.0
-                    compressed = compressed_height_estimate(height, folds, amplitude)
+# ============================================================
+# 6) Feasible design search and optimization
+# ============================================================
+def is_geometry_feasible(candidate: Dict[str, Any]) -> bool:
+    D = candidate["diameter_mm"]
+    H = candidate["height_mm"]
+    V_ml = candidate["volume_ml"]
+    compressed_h = candidate["compressed_height_mm"]
+
+    if D > MAX_DIAMETER_MM:
+        return False
+    if compressed_h >= MAX_COMPRESSED_HEIGHT_MM:
+        return False
+    if V_ml < MIN_WATER_CAPACITY_ML:
+        return False
+    if V_ml > 340.0:
+        return False
+    if H <= 0:
+        return False
+    return True
+
+
+def design_objective(candidate: Dict[str, Any]) -> float:
+    # prioritize closeness to target volume, then low compressed height, then compactness.
+    penalty = abs(candidate["volume_ml"] - TARGET_VOLUME_ML) / TARGET_VOLUME_ML
+    penalty += 0.4 * (candidate["compressed_height_mm"] / MAX_COMPRESSED_HEIGHT_MM)
+    penalty += 0.2 * (candidate["diameter_mm"] / MAX_DIAMETER_MM)
+    return penalty
+
+
+def generate_candidate_space() -> List[Dict[str, Any]]:
+    results: List[Dict[str, Any]] = []
+
+    for diameter in np.arange(40.0, MAX_DIAMETER_MM + 1.0, 1.0):
+        for height in np.arange(75.0, 170.0, 1.0):
+            for folds in range(5, 20):
+                for amplitude in np.arange(1.5, 12.0, 0.5):
+                    volume_mm3 = bellows_volume_mm3(height, diameter, folds, amplitude, samples=3500)
+                    volume_ml = volume_mm3 / 1000.0
+                    compressed_h = compressed_height_estimate(height, folds, amplitude)
+
                     cand = {
                         "diameter_mm": float(diameter),
                         "height_mm": float(height),
                         "folds": int(folds),
                         "amplitude_mm": float(amplitude),
-                        "volume_mm3": float(volume),
+                        "volume_mm3": float(volume_mm3),
                         "volume_ml": float(volume_ml),
-                        "compressed_height_mm": float(compressed),
+                        "compressed_height_mm": float(compressed_h),
                     }
-                    if cand["diameter_mm"] <= 70 and cand["compressed_height_mm"] < 25 and cand["volume_ml"] >= 250 and cand["volume_ml"] <= 340:
-                        candidates.append(cand)
-    return candidates
+
+                    if is_geometry_feasible(cand):
+                        thermal = evaluate_thermal_safety(cand, TARGET_OPERATING_TEMP_C, MATERIAL)
+                        cand["thermal_80c"] = thermal
+                        cand["penalty"] = design_objective(cand)
+                        results.append(cand)
+
+    return results
 
 
-def rank_candidate(c: Dict[str, Any]) -> Tuple[float, float, float, float]:
-    return (
-        abs(c["volume_ml"] - 300.0),
-        c["compressed_height_mm"],
-        c["diameter_mm"],
-        -c["volume_ml"],
-    )
+def select_best_candidate(candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not candidates:
+        raise ValueError("No feasible designs found.")
+
+    ranked = sorted(candidates, key=lambda c: (c["penalty"], c["compressed_height_mm"], c["diameter_mm"]))
+    return ranked[0]
 
 
-# ----------------------------
-# 6) Thermal safety evaluation
-# ----------------------------
-def evaluate_thermal_safety(candidate: Dict[str, Any], operating_temperature_c: float = 85.0,
-                            material: PPMaterialProperties = None) -> Dict[str, Any]:
-    if material is None:
-        material = PPMaterialProperties()
-
-    D = candidate["diameter_mm"]
+# ============================================================
+# 7) Mesh generation for 3D OBJ export
+# ============================================================
+def generate_bellows_obj(candidate: Dict[str, Any], file_path: str = "final_accordion_bottle.obj") -> None:
     H = candidate["height_mm"]
-    t = material.wall_thickness_mm
+    D = candidate["diameter_mm"]
+    folds = candidate["folds"]
+    amplitude = candidate["amplitude_mm"]
 
-    delta_t = operating_temperature_c - 23.0
-    sigma_thermal = thermal_expansion_stress_mpa(delta_t, material.elastic_modulus_mpa, material.thermal_expansion_coeff_1_per_k)
-    p_hydrostatic = hydrostatic_pressure_mpa(H, 1.0)
-    sigma_hydrostatic = hoop_stress_mpa(p_hydrostatic, D, t)
-    sigma_total = sigma_thermal + sigma_hydrostatic
-    sigma_material = tensile_strength_vs_temperature(operating_temperature_c, material)
-    sf = safety_factor_vs_temperature(operating_temperature_c, material, sigma_total)
+    z_steps = 220
+    theta_steps = 120
+    z = np.linspace(0.0, H, z_steps)
+    r = bellows_radius_profile(z, H, D, folds, amplitude)
 
-    return {
-        "operating_temperature_c": operating_temperature_c,
-        "thermal_expansion_stress_mpa": float(sigma_thermal),
-        "hydrostatic_stress_mpa": float(sigma_hydrostatic),
-        "combined_stress_mpa": float(sigma_total),
-        "material_strength_at_temp_mpa": float(sigma_material),
-        "safety_factor": float(sf),
-        "is_safe": sf >= 2.0,
-        "margin_to_failure_pct": float((sigma_material - sigma_total) / sigma_material * 100.0) if sigma_material > 0 else 0.0,
-    }
+    vertices: List[Tuple[float, float, float]] = []
+    faces: List[Tuple[int, int, int]] = []
+
+    # Build ring vertices: each profile point adds a circular ring
+    for i in range(z_steps):
+        zz = z[i]
+        rad = r[i]
+        for j in range(theta_steps):
+            theta = 2.0 * math.pi * j / theta_steps
+            x = rad * math.cos(theta)
+            y = rad * math.sin(theta)
+            vertices.append((x, y, zz))
+
+    ring_size = theta_steps
+    for i in range(z_steps - 1):
+        for j in range(theta_steps):
+            a = i * ring_size + j
+            b = i * ring_size + (j + 1) % ring_size
+            c = (i + 1) * ring_size + j
+            d = (i + 1) * ring_size + (j + 1) % ring_size
+
+            # two triangles per quad
+            faces.append((a, b, c))
+            faces.append((b, d, c))
+
+    # Add bottom and top caps to close the shape
+    bottom_center = len(vertices)
+    top_center = bottom_center + 1
+    vertices.append((0.0, 0.0, 0.0))
+    vertices.append((0.0, 0.0, H))
+
+    bottom_ring_start = 0
+    top_ring_start = (z_steps - 1) * ring_size
+
+    for j in range(theta_steps):
+        a = bottom_ring_start + j
+        b = bottom_ring_start + (j + 1) % ring_size
+        faces.append((bottom_center, a, b))
+
+    for j in range(theta_steps):
+        a = top_ring_start + j
+        b = top_ring_start + (j + 1) % ring_size
+        faces.append((top_center, b, a))
+
+    # Write OBJ file
+    with open(file_path, "w", encoding="utf-8") as f:
+        f.write("# Final accordion bottle mesh\n")
+        f.write(f"# volume_ml={candidate['volume_ml']:.2f}\n")
+        f.write(f"# diameter_mm={candidate['diameter_mm']:.2f}\n")
+        f.write(f"# height_mm={candidate['height_mm']:.2f}\n")
+        f.write(f"# folds={candidate['folds']}\n")
+        f.write(f"# amplitude_mm={candidate['amplitude_mm']:.2f}\n")
+        f.write("\n")
+
+        for x, y, zc in vertices:
+            f.write(f"v {x:.6f} {y:.6f} {zc:.6f}\n")
+
+        for a, b, c in faces:
+            f.write(f"f {a + 1} {b + 1} {c + 1}\n")
+
+    print(f"OBJ mesh exported to: {file_path}")
 
 
-# ----------------------------
-# 7) Main analysis
-# ----------------------------
+# ============================================================
+# 8) Final run
+# ============================================================
 def main() -> None:
-    material = PPMaterialProperties()
+    print("=" * 110)
+    print("Final accordion bottle optimization for PP COPO / Moplen EP310D HP")
+    print("=" * 110)
+    print(f"Target volume: {TARGET_VOLUME_ML} mL")
+    print(f"Minimum capacity: {MIN_WATER_CAPACITY_ML} mL")
+    print(f"Max diameter: {MAX_DIAMETER_MM} mm")
+    print(f"Compressed height limit: {MAX_COMPRESSED_HEIGHT_MM} mm")
+    print(f"Recommended operating temp: {TARGET_OPERATING_TEMP_C}°C")
+    print(f"Safety target: {SAFETY_TARGET}")
+    print()
 
-    print("=" * 100)
-    print("Accordion bottle design - material update to PP COPO / Moplen EP310D HP")
-    print("=" * 100)
-    print("Material properties used:")
-    print(f"- Density: {material.density_g_cm3} g/cm3")
-    print(f"- Tensile strength (yield): ~{material.tensile_strength_mpa_rt} MPa")
-    print(f"- Glass transition: {material.glass_transition_temp_c}°C")
-    print(f"- HDT @0.45 MPa: {material.heat_deflection_temp_045mpa_c}°C")
-    print(f"- HDT @1.8 MPa: {material.heat_deflection_temp_18mpa_c}°C")
-    print(f"- Max service temp used in screening: {material.max_service_temp_c}°C")
-    print(f"- CTE: {material.thermal_expansion_coeff_1_per_k} /°C")
+    candidates = generate_candidate_space()
+    print(f"Feasible designs found: {len(candidates)}")
 
-    temps = np.array([-20, 0, 23, 40, 60, 80, 90, 100, 120])
-    print("\nStrength vs temperature:")
-    print(f"{'Temp (°C)':>10} {'Strength (MPa)':>18}")
-    print("-" * 32)
-    for t in temps:
-        s = tensile_strength_vs_temperature(float(t), material)
-        print(f"{t:>10.0f} {s:>18.2f}")
+    if not candidates:
+        raise SystemExit("No feasible designs found for the requested constraints.")
 
-    candidates = sorted(generate_feasible_candidates(), key=rank_candidate)
-    print(f"\nFeasible candidate count: {len(candidates)}")
-    for i, c in enumerate(candidates[:10], 1):
-        print(f"{i:>2}. D={c['diameter_mm']:>5.1f} mm | H={c['height_mm']:>5.1f} mm | F={c['folds']:>2} | amp={c['amplitude_mm']:>4.1f} mm | V={c['volume_ml']:>6.1f} mL | comp={c['compressed_height_mm']:>5.1f} mm")
+    best = select_best_candidate(candidates)
+    thermal = evaluate_thermal_safety(best, TARGET_OPERATING_TEMP_C, MATERIAL)
 
-    best = candidates[0]
-    print("\nBest candidate:")
-    print(best)
+    print("Top candidates (sorted by objective):")
+    ranked = sorted(candidates, key=lambda c: (c["penalty"], c["compressed_height_mm"], c["diameter_mm"]))
+    for i, c in enumerate(ranked[:10], 1):
+        print(
+            f"{i}. D={c['diameter_mm']:.1f} mm | H={c['height_mm']:.1f} mm | "
+            f"F={c['folds']} | amp={c['amplitude_mm']:.1f} mm | "
+            f"V={c['volume_ml']:.1f} mL | comp={c['compressed_height_mm']:.1f} mm | "
+            f"SF@{TARGET_OPERATING_TEMP_C}°C={c['thermal_80c']['safety_factor']:.2f}"
+        )
 
-    for temp in [60, 70, 80, 90, 100]:
-        result = evaluate_thermal_safety(best, operating_temperature_c=temp, material=material)
-        print(f"\nAt {temp}°C:")
-        for k, v in result.items():
-            print(f"  {k}: {v}")
+    print("\nSelected best design:")
+    print(json.dumps(best, indent=2, ensure_ascii=False))
+    print("\nThermal safety at target temperature:")
+    print(json.dumps(thermal, indent=2, ensure_ascii=False))
 
-    report = {
-        "material": {
-            "name": material.name,
-            "density_g_cm3": material.density_g_cm3,
-            "tensile_strength_mpa_rt": material.tensile_strength_mpa_rt,
-            "elastic_modulus_mpa": material.elastic_modulus_mpa,
-            "heat_deflection_temp_045mpa_c": material.heat_deflection_temp_045mpa_c,
-            "heat_deflection_temp_18mpa_c": material.heat_deflection_temp_18mpa_c,
-            "glass_transition_temp_c": material.glass_transition_temp_c,
-            "thermal_expansion_coeff_1_per_k": material.thermal_expansion_coeff_1_per_k,
-            "source": "http://hongrunplastics.com/public/uploads/images/20250809/ALBIS%20PP%20COPO%20Moplen%20EP310D%20HP.pdf",
+    # Save summary JSON
+    summary = {
+        "material": asdict(MATERIAL),
+        "constraints": {
+            "target_volume_ml": TARGET_VOLUME_ML,
+            "min_capacity_ml": MIN_WATER_CAPACITY_ML,
+            "max_diameter_mm": MAX_DIAMETER_MM,
+            "max_compressed_height_mm": MAX_COMPRESSED_HEIGHT_MM,
+            "target_operating_temp_c": TARGET_OPERATING_TEMP_C,
+            "safety_target": SAFETY_TARGET,
         },
-        "best_design": best,
+        "best_candidate": best,
+        "thermal_safety": thermal,
+        "note": "For PP COPO, safe operating use is generally best below 80°C; above this, thicker wall or multilayer design is recommended."
     }
 
-    with open("pp_material_analysis_report.json", "w", encoding="utf-8") as f:
-        json.dump(report, f, indent=2, ensure_ascii=False)
+    with open("final_design_summary.json", "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
 
-    print("\nSaved pp_material_analysis_report.json")
+    generate_bellows_obj(best, "final_accordion_bottle.obj")
+
+    print("\nSaved: final_design_summary.json")
+    print("Saved: final_accordion_bottle.obj")
 
 
 if __name__ == "__main__":
